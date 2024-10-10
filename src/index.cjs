@@ -2,14 +2,11 @@ const {
 	EvidenceType,
 	TypeFidelity,
 	asyncIterableToBatchedAsyncGenerator,
-	cleanQuery,
 	exhaustStream
 } = require('@evidence-dev/db-commons');
 const runQuery = require('@evidence-dev/duckdb');
-const yaml = require('yaml');
 const fs = require('fs').promises;
 const { Database } = require('duckdb-async');
-const path = require('path');
 
 /**
  * @typedef {Object} DuckDBOptions
@@ -17,29 +14,22 @@ const path = require('path');
  */
 
 /** @type {import("@evidence-dev/db-commons").RunQuery<DuckDBOptions>} */
-module.exports = async (queryString, _, batchSize = 100000) => {
-	return runQuery(queryString, { filename: ':memory:' }, batchSize);
-};
+module.exports = async (queryString, _, batchSize = 100000) => runQuery(queryString, { filename: ':memory:' }, batchSize);
 
 /** @type {import("@evidence-dev/db-commons").GetRunner<DuckDBOptions>} */
 module.exports.getRunner = ({ accessKeyId, secretAccessKey, region }) => {
-	console.log(region);
 	let db, conn;
 
 	return async (queryContent, queryPath, batchSize = 100000) => {
-		// Filter out non-sql files
 		if (!queryPath.endsWith('.sql')) return null;
-		
 
 		if (!db) {
-			// Create a new DuckDB connection if it doesn't exist
 			db = await Database.create(':memory:', {
 				access_mode: 'READ_WRITE',
 				custom_user_agent: 'evidence-dev'
 			});
 			conn = await db.connect();
 
-			// Create the secret
 			await conn.exec(`
 				CREATE SECRET my_secret (
 					TYPE S3,
@@ -56,71 +46,33 @@ module.exports.getRunner = ({ accessKeyId, secretAccessKey, region }) => {
 		const stream = conn.stream(queryString);
 
 		const count_query = `WITH root as ${cleanQuery(queryString)} SELECT COUNT(*) FROM root`;
-		const expected_count = await db.all(count_query).catch(() => null);
+		const expected_count = await db.all(count_query).catch((error) => {
+			console.error('Error executing count query:', error);
+			return null;
+		});
 		const expected_row_count = expected_count?.[0]['count_star()'];
 
 		const column_query = `DESCRIBE ${cleanQuery(queryString)}`;
-		const column_types = await db.all(column_query).then(duckdbDescribeToEvidenceType).catch(() => null);
+		const column_types = await db.all(column_query)
+			.then(duckdbDescribeToEvidenceType)
+			.catch((error) => {
+				console.error('Error executing describe query:', error);
+				return null;
+			});
 
 		const results = await asyncIterableToBatchedAsyncGenerator(stream, batchSize, {
-			mapResultsToEvidenceColumnTypes:
-			column_types == null ? mapResultsToEvidenceColumnTypes : undefined,
-		standardizeRow
+			mapResultsToEvidenceColumnTypes: column_types == null ? mapResultsToEvidenceColumnTypes : undefined,
+			standardizeRow
 		});
 
 		if (column_types != null) {
 			results.columnTypes = column_types;
 		}
-		results.expectedRowCount = expected_row_count;
-		if (typeof results.expectedRowCount === 'bigint') {
-			results.expectedRowCount = Number(results.expectedRowCount);
-		}
+		results.expectedRowCount = Number(expected_row_count);
 
 		return results;
 	};
 };
-
-
-/**
- * Implementing this function creates an "advanced" connector
- *
- *
- * @see https://docs.evidence.dev/plugins/create-source-plugin/
- * @type {import("@evidence-dev/db-commons").GetRunner<ConnectorOptions>}
- */
-// Uncomment to use the advanced source interface
-// This uses the `yield` keyword, and returns the same type as getRunner, but with an added `name` and `content` field (content is used for caching)
-// sourceFiles provides an easy way to read the source directory to check for / iterate through files
-// /** @type {import("@evidence-dev/db-commons").ProcessSource<ConnectorOptions>} */
-// export async function* processSource(options, sourceFiles, utilFuncs) {
-//   yield {
-//     title: "some_demo_table",
-//     content: "SELECT * FROM some_demo_table", // This is ONLY used for caching
-//     rows: [], // rows can be an array
-//     columnTypes: [
-//       {
-//         name: "someInt",
-//         evidenceType: EvidenceType.NUMBER,
-//         typeFidelity: "inferred",
-//       },
-//     ],
-//   };
-//   yield {
-//     title: "some_demo_table",
-//     content: "SELECT * FROM some_demo_table", // This is ONLY used for caching
-//     rows: async function* () {}, // rows can be a generator function for returning batches of results (e.g. if an API is paginated, or database supports cursors)
-//     columnTypes: [
-//       {
-//         name: "someInt",
-//         evidenceType: EvidenceType.NUMBER,
-//         typeFidelity: "inferred",
-//       },
-//     ],
-//   };
-
-//  throw new Error("Process Source has not yet been implemented");
-// }
-
 
 /**
  * Converts BigInt values to Numbers in an object.
@@ -227,8 +179,6 @@ function duckdbDescribeToEvidenceType(describe) {
 	});
 }
 
-
-
 /** @type {import("@evidence-dev/db-commons").ConnectionTester<DuckDBOptions>} */
 module.exports.testConnection = async (opts) => {
 	const r = await runQuery('SELECT 1;', { ...opts, filename: ':memory:' })
@@ -241,8 +191,6 @@ module.exports.testConnection = async (opts) => {
 module.exports.options = {
 	accessKeyId: {
 		title: 'Access Key ID',
-		description:
-			"Access Key ID for the AWS S3 bucket.",
 		type: 'string',
 		secret: false,
 		shown: true,
@@ -250,16 +198,12 @@ module.exports.options = {
 	},
 	secretAccessKey: {
 		title: 'Secret Access Key',
-		description:
-			"Secret Access Key for the AWS S3 bucket.",
 		type: 'string',
 		secret: true,
 		default: ''
 	},
 	region: {
 		title: 'Region',
-		description:
-			"Region for the AWS S3 bucket.",
 		type: 'string',
 		secret: false,
 		default: ''
