@@ -7,128 +7,94 @@ const {
 } = require('@evidence-dev/db-commons');
 const runQuery = require('@evidence-dev/duckdb');
 const yaml = require('yaml');
-const fs = require('fs').promises;
 const { Database } = require('duckdb-async');
-const path = require('path');
 
 /**
  * @typedef {Object} DuckDBOptions
  * @property {string} options
  */
 
-/** @type {import("@evidence-dev/db-commons").RunQuery<DuckDBOptions>} */
-module.exports = async (queryString, _, batchSize = 100000) => {
-	return runQuery(queryString, { filename: ':memory:' }, batchSize);
-};
-
-/** @type {import("@evidence-dev/db-commons").GetRunner<DuckDBOptions>} */
-module.exports.getRunner = ({ accessKeyId, secretAccessKey, region }) => {
-	console.log(region);
-	let db, conn;
-
-	return async (queryContent, queryPath, batchSize = 100000) => {
-		// Filter out non-yaml files
-		if (!queryPath.endsWith('.yaml')) return null;
-		
-		// Read yaml file and get paths
-		const yamlFile = await fs.readFile(queryPath, 'utf8');
-		const yamlObj = yaml.parse(yamlFile);
-		const files = yamlObj.files;
-
-		const path = files[0].path;
-		const name = files[0].name;
-
-		if (!db) {
-			// Create a new DuckDB connection if it doesn't exist
-			db = await Database.create(':memory:', {
-				access_mode: 'READ_WRITE',
-				custom_user_agent: 'evidence-dev'
-			});
-			conn = await db.connect();
-
-			// Create the secret
-			await conn.exec(`
-				CREATE SECRET my_secret (
-					TYPE S3,
-					KEY_ID '${accessKeyId}',
-					SECRET '${secretAccessKey}',
-					REGION '${region}'
-				);
-			`);
-		}
-
-		const cleanQuery = (query) => `(${query})`;
-
-		const queryString = `FROM '${path}'`;
-		const stream = conn.stream(queryString);
-
-		const count_query = `WITH root as ${cleanQuery(queryString)} SELECT COUNT(*) FROM root`;
-		const expected_count = await db.all(count_query).catch(() => null);
-		const expected_row_count = expected_count?.[0]['count_star()'];
-
-		const column_query = `DESCRIBE ${cleanQuery(queryString)}`;
-		const column_types = await db.all(column_query).then(duckdbDescribeToEvidenceType).catch(() => null);
-
-		const results = await asyncIterableToBatchedAsyncGenerator(stream, batchSize, {
-			mapResultsToEvidenceColumnTypes:
-			column_types == null ? mapResultsToEvidenceColumnTypes : undefined,
-		standardizeRow,
-		closeConnection: () => db.close()
-		});
-
-		if (column_types != null) {
-			results.columnTypes = column_types;
-		}
-		results.expectedRowCount = expected_row_count;
-		if (typeof results.expectedRowCount === 'bigint') {
-			results.expectedRowCount = Number(results.expectedRowCount);
-		}
-
-		return results;
-	};
-};
-
-
 /**
  * Implementing this function creates an "advanced" connector
  *
- *
  * @see https://docs.evidence.dev/plugins/create-source-plugin/
- * @type {import("@evidence-dev/db-commons").GetRunner<ConnectorOptions>}
+ * @type {import("@evidence-dev/db-commons").ProcessSource<DuckDBOptions>}
  */
-// Uncomment to use the advanced source interface
-// This uses the `yield` keyword, and returns the same type as getRunner, but with an added `name` and `content` field (content is used for caching)
-// sourceFiles provides an easy way to read the source directory to check for / iterate through files
-// /** @type {import("@evidence-dev/db-commons").ProcessSource<ConnectorOptions>} */
-// export async function* processSource(options, sourceFiles, utilFuncs) {
-//   yield {
-//     title: "some_demo_table",
-//     content: "SELECT * FROM some_demo_table", // This is ONLY used for caching
-//     rows: [], // rows can be an array
-//     columnTypes: [
-//       {
-//         name: "someInt",
-//         evidenceType: EvidenceType.NUMBER,
-//         typeFidelity: "inferred",
-//       },
-//     ],
-//   };
-//   yield {
-//     title: "some_demo_table",
-//     content: "SELECT * FROM some_demo_table", // This is ONLY used for caching
-//     rows: async function* () {}, // rows can be a generator function for returning batches of results (e.g. if an API is paginated, or database supports cursors)
-//     columnTypes: [
-//       {
-//         name: "someInt",
-//         evidenceType: EvidenceType.NUMBER,
-//         typeFidelity: "inferred",
-//       },
-//     ],
-//   };
+module.exports.processSource = async function* (options, sourceFiles, utilFuncs) {
+	const { accessKeyId, secretAccessKey, region } = options;
+	let db, conn;
 
-//  throw new Error("Process Source has not yet been implemented");
-// }
+	if (!("files.yaml" in sourceFiles)) {
+		throw new Error('No YAML file found in source files');
+	}
+	const yamlFile = await sourceFiles["files.yaml"]();
+	const yamlContent = yaml.parse(yamlFile);
 
+	const files = yamlContent.files;
+	
+
+	console.log(files);
+
+	if (!files || files.length === 0) {
+		throw new Error('No files specified in the YAML file');
+	}
+
+	db = await Database.create(':memory:', {
+		access_mode: 'READ_WRITE',
+		custom_user_agent: 'evidence-dev'
+	});
+	conn = await db.connect();
+
+	await conn.exec(`
+		CREATE SECRET my_secret (
+			TYPE S3,
+			KEY_ID '${accessKeyId}',
+			SECRET '${secretAccessKey}',
+			REGION '${region}'
+		);
+	`);
+
+	try {
+		for (const file of files) {
+			console.log(file.name);
+			console.log(file.s3_path);
+			const s3path = file.s3_path;
+			const name = file.name;
+
+
+			const queryString = `FROM '${s3path}'`;
+			
+			const count_query = `WITH root as (${queryString}) SELECT COUNT(*) FROM root`;
+			const expected_count = await db.all(count_query).catch(() => null);
+			const expected_row_count = expected_count?.[0]['count_star()'];
+
+			const column_query = `DESCRIBE ${queryString}`;
+			const column_types = await db.all(column_query).then(duckdbDescribeToEvidenceType).catch(() => null);
+
+			yield {
+				title: name,
+				content: queryString,
+				rows: async function* () {
+					const stream = conn.stream(queryString);
+					for await (const batch of asyncIterableToBatchedAsyncGenerator(stream, 100000, {
+						mapResultsToEvidenceColumnTypes: column_types == null ? mapResultsToEvidenceColumnTypes : undefined,
+						standardizeRow,
+						closeConnection: () => {}  // We'll close the connection after processing all files
+					})) {
+						yield batch;
+					}
+				},
+				columnTypes: column_types,
+				expectedRowCount: typeof expected_row_count === 'bigint' ? Number(expected_row_count) : expected_row_count
+			};
+		}
+	} finally {
+		// Close the connection after processing all files
+		if (db) {
+			await db.close();
+		}
+	}
+};
 
 /**
  * Converts BigInt values to Numbers in an object.
@@ -235,15 +201,31 @@ function duckdbDescribeToEvidenceType(describe) {
 	});
 }
 
-
-
 /** @type {import("@evidence-dev/db-commons").ConnectionTester<DuckDBOptions>} */
 module.exports.testConnection = async (opts) => {
-	const r = await runQuery('SELECT 1;', { ...opts, filename: ':memory:' })
-		.then(exhaustStream)
-		.then(() => true)
-		.catch((e) => ({ reason: e.message ?? 'File not found' }));
-	return r;
+	const { accessKeyId, secretAccessKey, region } = opts;
+	const db = await Database.create(':memory:', {
+		access_mode: 'READ_WRITE',
+		custom_user_agent: 'evidence-dev'
+	});
+	const conn = await db.connect();
+
+	try {
+		await conn.exec(`
+			CREATE SECRET my_secret (
+				TYPE S3,
+				KEY_ID '${accessKeyId}',
+				SECRET '${secretAccessKey}',
+				REGION '${region}'
+			);
+		`);
+		await conn.all('SELECT 1');
+		return true;
+	} catch (e) {
+		return { reason: e.message ?? 'Connection failed' };
+	} finally {
+		await db.close();
+	}
 };
 
 module.exports.options = {
