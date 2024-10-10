@@ -27,16 +27,9 @@ module.exports.getRunner = ({ accessKeyId, secretAccessKey, region }) => {
 	let db, conn;
 
 	return async (queryContent, queryPath, batchSize = 100000) => {
-		// Filter out non-yaml files
-		if (!queryPath.endsWith('.yaml')) return null;
+		// Filter out non-sql files
+		if (!queryPath.endsWith('.sql')) return null;
 		
-		// Read yaml file and get paths
-		const yamlFile = await fs.readFile(queryPath, 'utf8');
-		const yamlObj = yaml.parse(yamlFile);
-		const files = yamlObj.files;
-
-		const path = files[0].path;
-		const name = files[0].name;
 
 		if (!db) {
 			// Create a new DuckDB connection if it doesn't exist
@@ -59,7 +52,7 @@ module.exports.getRunner = ({ accessKeyId, secretAccessKey, region }) => {
 
 		const cleanQuery = (query) => `(${query})`;
 
-		const queryString = `FROM '${path}'`;
+		const queryString = await fs.readFile(queryPath, 'utf8');
 		const stream = conn.stream(queryString);
 
 		const count_query = `WITH root as ${cleanQuery(queryString)} SELECT COUNT(*) FROM root`;
@@ -72,8 +65,7 @@ module.exports.getRunner = ({ accessKeyId, secretAccessKey, region }) => {
 		const results = await asyncIterableToBatchedAsyncGenerator(stream, batchSize, {
 			mapResultsToEvidenceColumnTypes:
 			column_types == null ? mapResultsToEvidenceColumnTypes : undefined,
-		standardizeRow,
-		closeConnection: () => db.close()
+		standardizeRow
 		});
 
 		if (column_types != null) {
